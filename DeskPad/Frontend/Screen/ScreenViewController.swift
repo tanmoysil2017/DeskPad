@@ -17,15 +17,30 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
     private var isWindowHighlighted = false
     private var previousResolution: CGSize?
     private var previousScaleFactor: CGFloat?
+    private var requestedDesktopSize: CGSize?
+    private var screenParametersObserver: NSObjectProtocol?
+
+    deinit {
+        if let observer = screenParametersObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        screenParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: NSApplication.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.selectRequestedDisplayMode()
+        }
 
         let descriptor = CGVirtualDisplayDescriptor()
         descriptor.setDispatchQueue(DispatchQueue.main)
         descriptor.name = "DeskPad Display"
         descriptor.maxPixelsWide = 5120
-        descriptor.maxPixelsHigh = 2160
+        descriptor.maxPixelsHigh = 5120
         descriptor.sizeInMillimeters = CGSize(width: 1600, height: 1000)
         descriptor.productID = 0x1234
         descriptor.vendorID = 0x3456
@@ -37,7 +52,7 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
 
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1
-        settings.modes = [
+        let landscapeModes = [
             // 32:9
             CGVirtualDisplayMode(width: 5120, height: 1440, refreshRate: 60),
             // 21:9 (239:100, 12:5)
@@ -58,6 +73,17 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
             CGVirtualDisplayMode(width: 1440, height: 900, refreshRate: 60),
             CGVirtualDisplayMode(width: 1280, height: 800, refreshRate: 60),
         ]
+        let savedWidth = UserDefaults.standard.integer(forKey: "desktopWidth")
+        let savedHeight = UserDefaults.standard.integer(forKey: "desktopHeight")
+        if (1 ... 5120).contains(savedWidth), (1 ... 5120).contains(savedHeight) {
+            requestedDesktopSize = CGSize(width: savedWidth, height: savedHeight)
+            settings.hiDPI = 0
+            settings.modes = [
+                CGVirtualDisplayMode(width: UInt(savedWidth), height: UInt(savedHeight), refreshRate: 60),
+            ]
+        } else {
+            settings.modes = landscapeModes
+        }
         display.apply(settings)
     }
 
@@ -79,10 +105,37 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
         {
             previousResolution = viewData.resolution
             previousScaleFactor = viewData.scaleFactor
+            stream?.stop()
             stream = nil
-            view.window?.setContentSize(viewData.resolution)
-            view.window?.contentAspectRatio = viewData.resolution
-            view.window?.center()
+            if let window = view.window {
+                window.contentAspectRatio = viewData.resolution
+                let aspectRatio = viewData.resolution.width / viewData.resolution.height
+                window.contentMinSize = CGSize(
+                    width: min(400, 300 * aspectRatio),
+                    height: min(300, 400 / aspectRatio)
+                )
+                let currentScreen = window.screen
+                let previewScreen = currentScreen?.displayID != display.displayID ? currentScreen : nil
+                let hostScreen = previewScreen ?? NSScreen.screens.first {
+                    $0.displayID != display.displayID
+                        && CGDisplayMirrorsDisplay($0.displayID) != display.displayID
+                }
+                let visibleFrame = hostScreen?.visibleFrame ?? window.frame
+                let availableSize = window.contentRect(forFrameRect: visibleFrame).size
+                let scale = min(
+                    1,
+                    availableSize.width / viewData.resolution.width,
+                    availableSize.height / viewData.resolution.height
+                )
+                window.setContentSize(CGSize(
+                    width: viewData.resolution.width * scale,
+                    height: viewData.resolution.height * scale
+                ))
+                window.setFrameOrigin(NSPoint(
+                    x: visibleFrame.midX - window.frame.width / 2,
+                    y: visibleFrame.midY - window.frame.height / 2
+                ))
+            }
             let stream = CGDisplayStream(
                 dispatchQueueDisplay: display.displayID,
                 outputWidth: Int(viewData.resolution.width * viewData.scaleFactor),
@@ -100,6 +153,72 @@ class ScreenViewController: SubscriberViewController<ScreenViewData>, NSWindowDe
             )
             self.stream = stream
             stream?.start()
+        }
+    }
+
+    /// Reconfigure the virtual monitor itself, rather than selecting a synthesized rotated mode.
+    @objc func rotateDisplay() {
+        guard let currentMode = CGDisplayCopyDisplayMode(display.displayID) else {
+            return
+        }
+        configureDesktop(width: currentMode.height, height: currentMode.width)
+    }
+
+    @objc func setDisplayResolution(_ sender: NSMenuItem) {
+        guard let size = (sender.representedObject as? NSValue)?.sizeValue else {
+            return
+        }
+        configureDesktop(width: Int(size.width), height: Int(size.height))
+    }
+
+    private func configureDesktop(width: Int, height: Int) {
+        guard CGDisplayMirrorsDisplay(display.displayID) == kCGNullDirectDisplay else {
+            showDisplayConfigurationError(
+                "DeskPad is currently mirroring another monitor. In System Settings → Displays, first set DeskPad Display to Extended display. Choose the DeskPad resolution here, then set DELL to mirror DeskPad Display and optimize for DeskPad Display."
+            )
+            return
+        }
+        let settings = CGVirtualDisplaySettings()
+        // Explicit 1× modes make the selected dimensions usable desktop space, not a Retina backing size.
+        settings.hiDPI = 0
+        settings.modes = [
+            CGVirtualDisplayMode(width: UInt(width), height: UInt(height), refreshRate: 60),
+        ]
+        requestedDesktopSize = CGSize(width: width, height: height)
+        guard display.apply(settings) else {
+            requestedDesktopSize = nil
+            showDisplayConfigurationError("macOS could not apply this resolution to DeskPad Display.")
+            return
+        }
+    }
+
+    private func selectRequestedDisplayMode() {
+        guard
+            let size = requestedDesktopSize,
+            let modes = CGDisplayCopyAllDisplayModes(display.displayID, nil) as? [CGDisplayMode],
+            let mode = modes.first(where: {
+                $0.width == Int(size.width) && $0.height == Int(size.height)
+                    && $0.pixelWidth == Int(size.width) && $0.pixelHeight == Int(size.height)
+                    && $0.isUsableForDesktopGUI()
+            })
+        else {
+            return
+        }
+        requestedDesktopSize = nil
+        guard CGDisplaySetDisplayMode(display.displayID, mode, nil) == .success else {
+            showDisplayConfigurationError("macOS rejected the selected resolution. If DELL is mirroring DeskPad, set Optimize for to DeskPad Display in System Settings → Displays.")
+            return
+        }
+        UserDefaults.standard.set(Int(size.width), forKey: "desktopWidth")
+        UserDefaults.standard.set(Int(size.height), forKey: "desktopHeight")
+    }
+
+    private func showDisplayConfigurationError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Unable to configure DeskPad Display"
+        alert.informativeText = message
+        if let window = view.window {
+            alert.beginSheetModal(for: window)
         }
     }
 
